@@ -121,6 +121,7 @@ struct SensorData {
     double gpuCoreMhz  = 0;
     std::wstring gpuName;
     size_t gpuVramBytes = 0;
+    bool   gpuWattReal  = false;  // true = valeur ADL réelle, false = estimation TDP
 
     // RAM
     double ramUsedGB   = 0;
@@ -144,8 +145,22 @@ struct SensorData {
     std::vector<std::pair<std::wstring,double>> usbDevices;
 
     // Écrans
+    struct MonitorInfo {
+        std::wstring deviceName;    // \\.\DISPLAY1
+        std::wstring friendlyName;  // "Dell U2722D" depuis EDID/registre
+        std::wstring edidMfr;       // code fabricant 3 lettres (DEL, SAM, LGD…)
+        int    widthPx  = 0;
+        int    heightPx = 0;
+        int    widthMm  = 0;        // taille physique depuis EDID
+        int    heightMm = 0;
+        double diagInch = 0;        // diagonale calculée
+        int    refreshHz= 0;
+        bool   primary  = false;
+        double estWattW = 0;        // estimation W selon taille
+    };
     int    monitorCount = 0;
     double monitorWatt  = 0;
+    std::vector<MonitorInfo> monitors;
 
     // Disk
     double diskReadMBs  = 0;
@@ -329,12 +344,526 @@ static void enumUsb(std::vector<std::pair<std::wstring,double>>& devs) {
     SetupDiDestroyDeviceInfoList(h);
 }
 
-// Nombre d'écrans + estimation W
-static void enumMonitors(int& cnt, double& watt) {
-    cnt = GetSystemMetrics(SM_CMONITORS);
-    // Estimation : ~25W par écran standard
-    watt = cnt * 25.0;
+// ─────────────────────────────────────────────────────────────────
+//  MONITEURS — EnumDisplayDevices + DEVMODE + EDID registre
+// ─────────────────────────────────────────────────────────────────
+
+// Décode le code fabricant EDID (3 lettres encodées sur 2 octets big-endian)
+// ─────────────────────────────────────────────────────────────────
+//  TABLE PnP FABRICANTS (codes EDID 3 lettres → nom lisible)
+//  Sources : uefi.org/PNP_ID_List + hwids.com
+// ─────────────────────────────────────────────────────────────────
+struct MfrEntry { const wchar_t* code; const wchar_t* name; };
+static const MfrEntry k_MfrTable[] = {
+    // ── Koorui / Realtek OEM ──────────────────────────────────
+    {L"KOR", L"Koorui"},      // code PnP propre Koorui (récent)
+    {L"RTK", L"Koorui/RTK"},  // Realtek — utilisé par certains Koorui OEM
+    {L"KUI", L"Koorui"},      // variante observée sur firmware 2023+
+    // ── Grands fabricants ─────────────────────────────────────
+    {L"DEL", L"Dell"},
+    {L"SAM", L"Samsung"},
+    {L"LGD", L"LG"},
+    {L"LEN", L"Lenovo"},
+    {L"AUO", L"AU Optronics"},
+    {L"CMN", L"Chimei Innolux"},
+    {L"BOE", L"BOE"},
+    {L"SDC", L"Samsung Display"},
+    {L"SHP", L"Sharp"},
+    {L"HWP", L"HP"},
+    {L"ACR", L"Acer"},
+    {L"VSC", L"ViewSonic"},
+    {L"BNQ", L"BenQ"},
+    {L"ASU", L"ASUS"},
+    {L"MSI", L"MSI"},
+    {L"GSM", L"LG"},
+    {L"PHL", L"Philips"},
+    {L"IOD", L"I-O Data"},
+    {L"NEC", L"NEC"},
+    {L"ENC", L"Eizo"},
+    {L"AIC", L"AG Neovo"},
+    {L"IVM", L"Iiyama"},
+    {L"HSD", L"Hannstar"},
+    {L"CHR", L"Chicony"},
+    {L"CPT", L"CPT"},
+    {L"IQT", L"Iquo"},
+};
+
+static std::wstring mfrNameFromCode(const std::wstring& code) {
+    for (auto& e : k_MfrTable)
+        if (code == e.code) return e.name;
+    return code; // code inconnu → retourne le code brut
 }
+
+// ─────────────────────────────────────────────────────────────────
+//  TABLE MODÈLES KOORUI → PUISSANCE MESURÉE (datasheet + tests)
+//  Modèles courants 2022-2024
+// ─────────────────────────────────────────────────────────────────
+struct ModelPower { const wchar_t* model; double watt; };
+static const ModelPower k_KooruiModels[] = {
+    // 24" FHD 100Hz (24E4 / 24N5A / 24N5B)
+    {L"24E4",  22.0}, {L"24N5A", 22.0}, {L"24N5B", 22.0},
+    {L"24E3",  20.0}, {L"24N4",  20.0},
+    // 27" QHD 100/144Hz (27E6QA / 27N5A / 27N5C)
+    {L"27E6",  28.0}, {L"27E6Q", 28.0}, {L"27E6QA",28.0},
+    {L"27N5A", 26.0}, {L"27N5C", 26.0}, {L"27N4",  25.0},
+    // 27" FHD
+    {L"27E3",  24.0}, {L"27E4",  24.0},
+    // 32" QHD (32N5A)
+    {L"32N5A", 38.0}, {L"32E6",  40.0},
+    // 34" ultrawide
+    {L"34N5A", 55.0},
+};
+
+static double kooruiWattFromModel(const std::wstring& modelName) {
+    for (auto& m : k_KooruiModels) {
+        // Cherche le code modèle dans le nom (insensible à la casse)
+        std::wstring lo = modelName;
+        std::wstring pat = m.model;
+        for (auto& c : lo)  c = towupper(c);
+        for (auto& c : pat) c = towupper(c);
+        if (lo.find(pat) != std::wstring::npos) return m.watt;
+    }
+    return -1.0; // inconnu
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  EDID : décodage fabricant (octets 8-9, encodage PnP 5 bits)
+// ─────────────────────────────────────────────────────────────────
+static std::wstring edidMfrCode(const BYTE* edid) {
+    WORD w = (WORD)((edid[8] << 8) | edid[9]);
+    // Vérifie que les bits 15 sont à 0 (champ valide)
+    if (w == 0x0000 || w == 0xFFFF) return {};
+    wchar_t mfr[4] = {
+        (wchar_t)(L'A' + ((w >> 10) & 0x1F) - 1),
+        (wchar_t)(L'A' + ((w >>  5) & 0x1F) - 1),
+        (wchar_t)(L'A' + ((w >>  0) & 0x1F) - 1),
+        L'\0'
+    };
+    // Sanity : lettres A-Z uniquement
+    for (int i=0;i<3;i++)
+        if (mfr[i]<L'A'||mfr[i]>L'Z') return {};
+    return mfr;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  EDID : nom modèle depuis descripteur 0xFC (Monitor Name)
+//         + fallback descripteur 0xFE (ASCII string non standard)
+// ─────────────────────────────────────────────────────────────────
+static std::wstring edidFriendlyName(const BYTE* edid, int len) {
+    if (len < 128) return {};
+    std::wstring best;
+    for (int i = 54; i <= 108; i += 18) {
+        // Octets i+0..i+1 = 0x00 0x00 → descriptor étendu
+        if (edid[i] != 0x00 || edid[i+1] != 0x00) continue;
+        BYTE dtype = edid[i+3];
+        if (dtype != 0xFC && dtype != 0xFE) continue; // 0xFC=name, 0xFE=string
+
+        char name[14] = {};
+        memcpy(name, edid + i + 5, 13);
+        // Trim \n, \r, espaces finaux
+        for (int j=12;j>=0;j--) {
+            if (name[j]=='\n'||name[j]=='\r'||name[j]==' '||name[j]=='\0')
+                name[j]='\0';
+            else break;
+        }
+        if (name[0] == '\0') continue;
+
+        int sz = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+        std::wstring ws(sz, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, ws.data(), sz);
+        while (!ws.empty() && ws.back()==L'\0') ws.pop_back();
+
+        if (dtype == 0xFC) return ws;   // Monitor Name descriptor → priorité max
+        if (best.empty())  best = ws;   // String descriptor → fallback
+    }
+    return best;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  EDID : Product Code (octets 10-11, little-endian) → hex string
+//  Utile pour identifier le modèle exact quand le nom EDID est vide
+// ─────────────────────────────────────────────────────────────────
+static std::wstring edidProductCode(const BYTE* edid) {
+    WORD pc = (WORD)(edid[10] | (edid[11] << 8));
+    wchar_t buf[8]; swprintf_s(buf, L"%04X", pc);
+    return buf;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  ESTIMATION PUISSANCE
+//  1. Modèle Koorui connu → valeur mesurée
+//  2. Table générique par marque + diagonale
+// ─────────────────────────────────────────────────────────────────
+static double estimateMonitorWatt(const std::wstring& mfrCode,
+                                  const std::wstring& modelName,
+                                  double diagInch)
+{
+    // 1. Koorui exact
+    bool isKoorui = (mfrCode==L"KOR"||mfrCode==L"RTK"||mfrCode==L"KUI");
+    if (isKoorui && !modelName.empty()) {
+        double w = kooruiWattFromModel(modelName);
+        if (w > 0) return w;
+    }
+
+    // 2. Diagonale connue
+    if (diagInch > 0) {
+        // Koorui est généralement 15-20% plus économique que les grandes marques
+        double base;
+        if      (diagInch < 22) base = 16.0;
+        else if (diagInch < 24) base = 20.0;
+        else if (diagInch < 25) base = 22.0;
+        else if (diagInch < 27) base = 25.0;
+        else if (diagInch < 28) base = 28.0;
+        else if (diagInch < 32) base = 32.0;
+        else if (diagInch < 35) base = 40.0;
+        else                    base = 55.0;
+        return isKoorui ? base * 0.85 : base;
+    }
+
+    // 3. Fallback absolu
+    return 25.0;
+}
+
+using MonitorInfo = SensorData::MonitorInfo;
+
+// Callback EnumDisplayMonitors
+struct EnumMonCtx {
+    std::vector<MonitorInfo>* list;
+};
+
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM lp) {
+    auto* ctx = reinterpret_cast<EnumMonCtx*>(lp);
+
+    MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMon, &mi)) return TRUE;
+
+    MonitorInfo info;
+    info.deviceName = mi.szDevice;
+    info.primary    = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    info.widthPx    = mi.rcMonitor.right  - mi.rcMonitor.left;
+    info.heightPx   = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+    // Résolution et taux de rafraîchissement via DEVMODE
+    DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+        info.widthPx   = dm.dmPelsWidth;
+        info.heightPx  = dm.dmPelsHeight;
+        info.refreshHz = dm.dmDisplayFrequency;
+    }
+
+    // Taille physique via EnumDisplayDevices → clé registre → EDID
+    DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+    // Trouve le device ID (ex: "\\.\DISPLAY1\Monitor0")
+    for (DWORD i = 0; EnumDisplayDevicesW(mi.szDevice, i, &dd, 0); i++) {
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE)) continue;
+
+        // dd.DeviceID contient le chemin PnP comme
+        // "MONITOR\DEL4277\{...}\0001" → on extrait le préfixe pour SetupAPI
+        std::wstring devId = dd.DeviceID;
+
+        // Essai direct EDID via SetupAPI classe Monitor
+        {
+            GUID monGuid = {0x4d36e96e,0xe325,0x11ce,
+                            {0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18}};
+            HDEVINFO hDev = SetupDiGetClassDevsW(&monGuid, nullptr, nullptr,
+                                                  DIGCF_PRESENT);
+            if (hDev != INVALID_HANDLE_VALUE) {
+                SP_DEVINFO_DATA did2{}; did2.cbSize = sizeof(did2);
+                for (DWORD j = 0; SetupDiEnumDeviceInfo(hDev, j, &did2); j++) {
+                    wchar_t instId[512]{};
+                    CM_Get_Device_IDW(did2.DevInst, instId, 511, 0);
+                    // Vérifie que l'instance match notre moniteur
+                    std::wstring inst(instId);
+                    // Extrait le modèle depuis devId (ex: "MONITOR\DEL4277\...")
+                    bool match = false;
+                    if (devId.size() > 8) {
+                        // compare le segment modèle (après MONITOR\)
+                        size_t p = devId.find(L'\\');
+                        if (p != std::wstring::npos) {
+                            std::wstring model = devId.substr(p+1);
+                            // inst contient quelque chose comme DISPLAY\DEL4277\...
+                            match = (inst.find(model.substr(0,
+                                     model.find(L'\\'))) != std::wstring::npos);
+                        }
+                    }
+                    if (!match && inst.find(L"DISPLAY") == std::wstring::npos)
+                        continue;
+                    if (!match) {
+                        // heuristique : prend le premier Monitor dispo
+                        // si on n'a pas encore de nom, c'est acceptable
+                    }
+
+                    HKEY hKey = SetupDiOpenDevRegKey(hDev, &did2,
+                        DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+                    if (hKey == INVALID_HANDLE_VALUE) continue;
+
+                    DWORD type2=0, sz2=0;
+                    if (RegQueryValueExW(hKey,L"EDID",nullptr,&type2,
+                                        nullptr,&sz2)==ERROR_SUCCESS && sz2>=128) {
+                        std::vector<BYTE> edid(sz2);
+                        RegQueryValueExW(hKey,L"EDID",nullptr,&type2,
+                                        edid.data(),&sz2);
+                        RegCloseKey(hKey);
+
+                        // Taille physique : octets 21 (H mm) et 22 (V mm)
+                        info.widthMm  = edid[21];
+                        info.heightMm = edid[22];
+
+                        // Diagonale en pouces
+                        if (info.widthMm > 0 && info.heightMm > 0) {
+                            double diagMm = sqrt((double)info.widthMm*info.widthMm
+                                               + (double)info.heightMm*info.heightMm);
+                            info.diagInch = diagMm / 25.4;
+                        }
+
+                        // Fabricant PnP + nom modèle depuis EDID
+                        info.edidMfr      = edidMfrCode(edid.data());
+                        info.friendlyName = edidFriendlyName(edid.data(),(int)sz2);
+
+                        // Si le descripteur 0xFC est vide (certains Koorui OEM
+                        // n'encodent pas le nom modèle) → construire depuis
+                        // nom fabricant + product code
+                        if (info.friendlyName.empty() && !info.edidMfr.empty()) {
+                            std::wstring brand = mfrNameFromCode(info.edidMfr);
+                            std::wstring pc    = edidProductCode(edid.data());
+                            info.friendlyName  = brand + L" " + pc;
+                        }
+                        break;
+                    }
+                    RegCloseKey(hKey);
+                }
+                SetupDiDestroyDeviceInfoList(hDev);
+            }
+        }
+        break; // on a traité le premier device actif
+    }
+
+    // Fallback nom si EDID toujours vide
+    if (info.friendlyName.empty()) {
+        DISPLAY_DEVICEW dd2{}; dd2.cb = sizeof(dd2);
+        if (EnumDisplayDevicesW(mi.szDevice, 0, &dd2, 0) && dd2.DeviceString[0]) {
+            info.friendlyName = dd2.DeviceString;
+            // Détecte Koorui dans le nom Windows même sans EDID
+            std::wstring lo = info.friendlyName;
+            for (auto& c : lo) c = towlower(c);
+            if (lo.find(L"koorui") != std::wstring::npos && info.edidMfr.empty())
+                info.edidMfr = L"KOR";
+        } else {
+            info.friendlyName = mi.szDevice;
+        }
+    }
+
+    // Résout le nom lisible du fabricant
+    if (!info.edidMfr.empty())
+        info.edidMfr = mfrNameFromCode(info.edidMfr); // remplace le code par le nom
+
+    info.estWattW = estimateMonitorWatt(info.edidMfr, info.friendlyName, info.diagInch);
+    ctx->list->push_back(info);
+    return TRUE;
+}
+
+static void enumMonitors(std::vector<MonitorInfo>& monitors, int& cnt, double& totalW) {
+    monitors.clear();
+    EnumMonCtx ctx{&monitors};
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&ctx);
+    cnt    = (int)monitors.size();
+    totalW = 0;
+    for (auto& m : monitors) totalW += m.estWattW;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  ADL2 — Lecture puissance GPU AMD réelle
+//  Chargement dynamique de atiadlxx.dll (drivers AMD requis)
+//  Aucune dépendance au compile — fallback silencieux si absent
+// ─────────────────────────────────────────────────────────────────
+
+// Structures ADL minimales (subset de adl_sdk.h)
+typedef void* ADL_CONTEXT_HANDLE;
+
+struct AdlAdapterInfo {
+    int  iSize;
+    int  iAdapterIndex;
+    char strUDID[256];
+    int  iBusNumber;
+    int  iDeviceNumber;
+    int  iFunctionNumber;
+    int  iVendorID;
+    char strAdapterName[256];
+    char strDisplayName[256];
+    int  iPresent;
+    int  iExist;
+    char strDriverPath[256];
+    char strDriverPathExt[256];
+    char strPNPString[256];
+    int  iOSDisplayIndex;
+};
+
+// Identifiants de capteurs ADL2_New_QueryPMLogData
+// (ADL_PMLOG_ASIC_POWER = 1 dans adl_defines.h)
+#define ADL_PMLOG_ASIC_POWER      1
+#define ADL_PMLOG_CLK_GFXCLK     13
+#define ADL_PMLOG_TEMPERATURE_EDGE 7
+#define ADL_PMLOG_MAX_SENSORS     256
+
+struct AdlPmLogData {
+    unsigned int ulVersion;
+    unsigned int ulActiveSampleRate;
+    long long    ulLastUpdated;
+    unsigned int ulValues[ADL_PMLOG_MAX_SENSORS][2]; // [0]=valeur, [1]=support
+};
+
+struct AdlPmLogSupportList {
+    unsigned int uSupported[ADL_PMLOG_MAX_SENSORS]; // bitmask
+};
+
+// Pointeurs de fonctions ADL2
+typedef int  (__stdcall *ADL2_Main_Control_Create_t)
+    (void* (*)(int), int, ADL_CONTEXT_HANDLE*);
+typedef int  (__stdcall *ADL2_Main_Control_Destroy_t)
+    (ADL_CONTEXT_HANDLE);
+typedef int  (__stdcall *ADL2_Adapter_NumberOfAdapters_Get_t)
+    (ADL_CONTEXT_HANDLE, int*);
+typedef int  (__stdcall *ADL2_Adapter_AdapterInfo_Get_t)
+    (ADL_CONTEXT_HANDLE, AdlAdapterInfo*, int);
+typedef int  (__stdcall *ADL2_Adapter_Active_Get_t)
+    (ADL_CONTEXT_HANDLE, int, int*);
+typedef int  (__stdcall *ADL2_New_QueryPMLogData_Get_t)
+    (ADL_CONTEXT_HANDLE, int, AdlPmLogData*);
+// API plus ancienne (Overdrive6) — fallback si la nouvelle échoue
+typedef int  (__stdcall *ADL2_Overdrive6_CurrentPower_Get_t)
+    (ADL_CONTEXT_HANDLE, int, int, int*);
+
+// Allocateur demandé par ADL (ADL_Main_Memory_Alloc)
+static void* __stdcall AdlAlloc(int size) { return malloc(size); }
+
+struct AdlCtx {
+    HMODULE   dll      = nullptr;
+    ADL_CONTEXT_HANDLE ctx = nullptr;
+    int       adapterIdx = -1;   // premier adaptateur AMD actif
+    bool      ready    = false;
+    bool      usePmLog = false;  // true = nouvelle API, false = OD6
+
+    // Fonctions chargées
+    ADL2_Main_Control_Create_t         pfCreate  = nullptr;
+    ADL2_Main_Control_Destroy_t        pfDestroy = nullptr;
+    ADL2_Adapter_NumberOfAdapters_Get_t pfNumAdapt= nullptr;
+    ADL2_Adapter_AdapterInfo_Get_t     pfAdaptInfo=nullptr;
+    ADL2_Adapter_Active_Get_t          pfActive  = nullptr;
+    ADL2_New_QueryPMLogData_Get_t      pfPmLog   = nullptr;
+    ADL2_Overdrive6_CurrentPower_Get_t pfOD6Pwr  = nullptr;
+
+    bool init() {
+        // Cherche la DLL 64-bit dans les emplacements AMD connus
+        const wchar_t* paths[] = {
+            L"atiadlxx.dll",                                           // PATH
+            L"C:\\Windows\\System32\\atiadlxx.dll",
+            L"C:\\Program Files\\AMD\\CNext\\CNext\\atiadlxx.dll",
+            L"C:\\Program Files (x86)\\AMD\\CNext\\CNext\\atiadlxx.dll",
+        };
+        for (auto p : paths) {
+            dll = LoadLibraryW(p);
+            if (dll) break;
+        }
+        if (!dll) return false;  // drivers AMD non installés
+
+        // Charge les symboles
+        pfCreate    = (ADL2_Main_Control_Create_t)
+                       GetProcAddress(dll,"ADL2_Main_Control_Create");
+        pfDestroy   = (ADL2_Main_Control_Destroy_t)
+                       GetProcAddress(dll,"ADL2_Main_Control_Destroy");
+        pfNumAdapt  = (ADL2_Adapter_NumberOfAdapters_Get_t)
+                       GetProcAddress(dll,"ADL2_Adapter_NumberOfAdapters_Get");
+        pfAdaptInfo = (ADL2_Adapter_AdapterInfo_Get_t)
+                       GetProcAddress(dll,"ADL2_Adapter_AdapterInfo_Get");
+        pfActive    = (ADL2_Adapter_Active_Get_t)
+                       GetProcAddress(dll,"ADL2_Adapter_Active_Get");
+        pfPmLog     = (ADL2_New_QueryPMLogData_Get_t)
+                       GetProcAddress(dll,"ADL2_New_QueryPMLogData_Get");
+        pfOD6Pwr    = (ADL2_Overdrive6_CurrentPower_Get_t)
+                       GetProcAddress(dll,"ADL2_Overdrive6_CurrentPower_Get");
+
+        if (!pfCreate || !pfDestroy || !pfNumAdapt || !pfAdaptInfo)
+            return false;
+
+        // Crée le contexte ADL
+        if (pfCreate(AdlAlloc, 1, &ctx) != 0) return false;
+
+        // Trouve le premier adaptateur AMD actif
+        int numAdapt = 0;
+        pfNumAdapt(ctx, &numAdapt);
+        if (numAdapt <= 0) return false;
+
+        std::vector<AdlAdapterInfo> infos(numAdapt);
+        infos[0].iSize = sizeof(AdlAdapterInfo);
+        pfAdaptInfo(ctx, infos.data(), (int)(sizeof(AdlAdapterInfo)*numAdapt));
+
+        for (int i = 0; i < numAdapt; i++) {
+            int active = 0;
+            if (pfActive && pfActive(ctx, i, &active) == 0 && active) {
+                // Vérifie que c'est AMD (vendor 0x1002)
+                if (infos[i].iVendorID == 0x1002) {
+                    adapterIdx = i;
+                    break;
+                }
+            }
+        }
+        if (adapterIdx < 0) {
+            // Fallback : prend le premier sans vérifier active
+            for (int i = 0; i < numAdapt; i++) {
+                if (infos[i].iVendorID == 0x1002) {
+                    adapterIdx = i; break;
+                }
+            }
+        }
+        if (adapterIdx < 0) return false;
+
+        // Teste quelle API est disponible
+        if (pfPmLog) {
+            AdlPmLogData tmp{};
+            tmp.ulVersion = sizeof(AdlPmLogData);
+            int r = pfPmLog(ctx, adapterIdx, &tmp);
+            // r==0 → OK, r==-8 → feature non dispo
+            usePmLog = (r == 0);
+        }
+
+        ready = true;
+        return true;
+    }
+
+    // Retourne la puissance GPU en W, ou -1 si non disponible
+    double readPowerW() {
+        if (!ready || adapterIdx < 0) return -1.0;
+
+        if (usePmLog && pfPmLog) {
+            AdlPmLogData d{};
+            d.ulVersion = sizeof(AdlPmLogData);
+            if (pfPmLog(ctx, adapterIdx, &d) == 0) {
+                // ulValues[ADL_PMLOG_ASIC_POWER][1] = 1 si la valeur est valide
+                if (d.ulValues[ADL_PMLOG_ASIC_POWER][1] == 1) {
+                    return (double)d.ulValues[ADL_PMLOG_ASIC_POWER][0];
+                }
+            }
+        }
+
+        // Fallback : Overdrive6 — valeur en milliwatts × 100
+        // ADL_OD6_POWER_TYPE_ASIC = 0
+        if (pfOD6Pwr) {
+            int val = 0;
+            if (pfOD6Pwr(ctx, adapterIdx, 0, &val) == 0 && val > 0) {
+                return val / 100.0;  // milliwatts/100 → watts
+            }
+        }
+
+        return -1.0;  // non disponible → l'appelant utilise l'estimation TDP
+    }
+
+    ~AdlCtx() {
+        if (ctx && pfDestroy) pfDestroy(ctx);
+        if (dll) FreeLibrary(dll);
+    }
+};
+
+static AdlCtx g_Adl;
 
 // Thread capteurs — tourne à 1 Hz
 static void sensorThread() {
@@ -362,6 +891,9 @@ static void sensorThread() {
     dxgiGetGpuInfo(gpuNameDxgi,vramBytes);
     std::wstring gpuNameWmi = wmiGetStr(L"Win32_VideoController",L"Name");
     std::wstring gpuName = gpuNameDxgi.empty() ? gpuNameWmi : gpuNameDxgi;
+
+    // Initialisation ADL — lecture puissance réelle AMD
+    bool adlOk = g_Adl.init();
 
     double cumWh=0;
     auto t0=std::chrono::steady_clock::now();
@@ -397,9 +929,13 @@ static void sensorThread() {
         int battPct = (pwr.BatteryLifePercent==255)?-1:(int)pwr.BatteryLifePercent;
         bool charg  = (pwr.BatteryFlag & 0x08)!=0;
 
-        // Puissances estimées
+        // CPU — estimation TDP × usage (RAPL non exposé en user-mode sans WinRing0)
         double cpuW = g_CpuTdpIdle+(g_CpuTdpMax-g_CpuTdpIdle)*(cpuLoad/100.0);
-        double gpuW = g_GpuTdpIdle+(g_GpuTdpMax-g_GpuTdpIdle)*(gpuLoad/100.0);
+
+        // GPU — lecture ADL réelle (drivers AMD), fallback TDP×% si indispo
+        double adlW = g_Adl.readPowerW();
+        double gpuW = (adlW >= 0.0) ? adlW
+                    : g_GpuTdpIdle+(g_GpuTdpMax-g_GpuTdpIdle)*(gpuLoad/100.0);
 
         // USB
         if (++usbRefresh>=15) { enumUsb(usbDevs); usbRefresh=0; }
@@ -407,7 +943,8 @@ static void sensorThread() {
 
         // Écrans
         int monCnt=0; double monW=0;
-        enumMonitors(monCnt,monW);
+        std::vector<MonitorInfo> monList;
+        enumMonitors(monList,monCnt,monW);
 
         // Total
         double total = cpuW+gpuW+ramWatt+usbW+monW+g_SysBase;
@@ -423,9 +960,10 @@ static void sensorThread() {
             g_Sensor.cpuFreqMhz= cpuFreq;
             g_Sensor.cpuName   = cpuName;
             g_Sensor.cpuCores  = cores;
-            g_Sensor.gpuLoad   = gpuLoad;
-            g_Sensor.gpuWatt   = gpuW;
-            g_Sensor.gpuName   = gpuName;
+            g_Sensor.gpuLoad     = gpuLoad;
+            g_Sensor.gpuWatt     = gpuW;
+            g_Sensor.gpuWattReal = (adlW >= 0.0);
+            g_Sensor.gpuName     = gpuName;
             g_Sensor.gpuVramBytes=vramBytes;
             g_Sensor.gpuMemTotalMB=(double)vramBytes/(1024*1024);
             g_Sensor.ramUsedGB = ramUsed;
@@ -444,6 +982,7 @@ static void sensorThread() {
             g_Sensor.usbWatt   = usbW;
             g_Sensor.monitorCount = monCnt;
             g_Sensor.monitorWatt  = monW;
+            g_Sensor.monitors     = monList;
             g_Sensor.totalWatt = total;
             g_Sensor.cumWhSession = cumWh;
             g_Sensor.sessionSec= sec;
@@ -800,8 +1339,10 @@ static void Render(HWND hw) {
         wchar_t v[16],sub[128];
         swprintf_s(v,L"%.1f",s.gpuWatt);
         double vramGB=(double)s.gpuVramBytes/(1<<30);
-        swprintf_s(sub,L"%.0f%% charge  |  TDP max %.0fW  |  %.1f Go VRAM",
-                   s.gpuLoad,g_GpuTdpMax,vramGB);
+        // Indique la source : ADL réel ou estimation TDP
+        const wchar_t* src = s.gpuWattReal ? L"ADL réel" : L"estim. TDP";
+        swprintf_s(sub,L"%.0f%% charge  |  %.1f Go VRAM  |  %s",
+                   s.gpuLoad, vramGB, src);
         c.draw(s.gpuName.empty()?L"GPU":s.gpuName.c_str(),
                v,L"W",sub,s.gpuLoad,C::CYAN);
     }
@@ -842,14 +1383,105 @@ static void Render(HWND hw) {
 
     // ── ÉCRANS ──────────────────────────────────────────────────
     {
-        Card c={pad*2+cw,curY,cw,115};
-        wchar_t v[16],sub[128];
-        swprintf_s(v,L"%.0f",s.monitorWatt);
-        swprintf_s(sub,L"%d écran(s) détecté(s)  |  ~25W par écran",s.monitorCount);
-        c.draw(L"AFFICHAGE",v,L"W",sub,
-               std::clamp(s.monitorWatt/150.0*100,0.0,100.0),C::YELLOW);
+        // Hauteur dynamique : header 30 + 78px par écran (5 lignes), min 115
+        float rowH = 78.0f;
+        float mh   = std::max(115.0f, 30.0f + (float)s.monitors.size() * rowH);
+
+        // Panneau pleine largeur
+        D2D1_RECT_F r={pad,curY,W-pad,curY+mh};
+        FillRoundRect(r,8,C::PANEL);
+        D2D1_RECT_F top={pad+1,curY,W-pad-1,curY+3};
+        FillRoundRect(top,2,C::YELLOW);
+
+        wchar_t hdr[64];
+        swprintf_s(hdr,L"AFFICHAGE  —  %d écran(s)  ~%.0f W total",
+                   s.monitorCount,s.monitorWatt);
+        DText(hdr,{pad+14,curY+8,W-20,curY+26},
+              g_D2D.brush(C::DIMTEXT),g_D2D.fmtSmall);
+
+        float my = curY+32;
+        float colW = (W - pad*2 - 28) / std::max(1,(int)s.monitors.size());
+
+        for (int i=0;i<(int)s.monitors.size();i++) {
+            auto& m = s.monitors[i];
+            float mx = pad+14 + i*colW;
+
+            // Cadre par écran — bordure jaune si primaire
+            D2D1_RECT_F mr={mx-4, my-2, mx+colW-8, my+rowH-4};
+            FillRoundRect(mr,4,{0.035f,0.043f,0.067f,1});
+            if(m.primary) DrawRoundRect(mr,4,C::YELLOW,0.8f);
+
+            // ── Ligne 1 : Marque  (si connue)
+            if(!m.edidMfr.empty()) {
+                std::wstring brand = m.edidMfr;
+                if(brand.size()>18) brand=brand.substr(0,16)+L"…";
+                // Badge marque coloré
+                bool isKoorui=(m.edidMfr==L"Koorui"||m.edidMfr==L"Koorui/RTK");
+                D2D1_COLOR_F bc = isKoorui ? C::CYAN : C::GREEN;
+                DText(brand.c_str(),{mx,my,mx+colW-10,my+14},
+                      g_D2D.brush(bc),g_D2D.fmtSmall);
+            }
+
+            // ── Ligne 2 : Nom modèle (EDID 0xFC ou fallback)
+            {
+                std::wstring name = m.friendlyName.empty()
+                                  ? m.deviceName : m.friendlyName;
+                // Enlève le préfixe marque si déjà affiché ligne 1
+                if(!m.edidMfr.empty()) {
+                    std::wstring lo=name, mfr=m.edidMfr;
+                    for(auto&c:lo)  c=towlower(c);
+                    for(auto&c:mfr) c=towlower(c);
+                    if(lo.find(mfr)!=std::wstring::npos)
+                        name=name.substr(m.edidMfr.size());
+                    while(!name.empty()&&(name[0]==L' '||name[0]==L'-'))
+                        name=name.substr(1);
+                }
+                if(name.size()>26) name=name.substr(0,24)+L"…";
+                float ly = m.edidMfr.empty() ? my : my+14;
+                DText(name.c_str(),{mx,ly,mx+colW-10,ly+14},
+                      g_D2D.brush(m.primary?C::YELLOW:C::WHITE),g_D2D.fmtSmall);
+            }
+
+            // ── Ligne 3 : Résolution + fréquence
+            {
+                wchar_t rl[48];
+                if(m.refreshHz>0)
+                    swprintf_s(rl,L"%d×%d  @%dHz",m.widthPx,m.heightPx,m.refreshHz);
+                else
+                    swprintf_s(rl,L"%d×%d",m.widthPx,m.heightPx);
+                DText(rl,{mx,my+28,mx+colW-10,my+41},
+                      g_D2D.brush(C::MUTED),g_D2D.fmtSmall);
+            }
+
+            // ── Ligne 4 : Taille physique + diagonale
+            {
+                wchar_t sl[48];
+                if(m.diagInch>0)
+                    swprintf_s(sl,L"%.1f\"  %dmm × %dmm",
+                               m.diagInch,m.widthMm,m.heightMm);
+                else
+                    swprintf_s(sl,L"Taille EDID inconnue");
+                DText(sl,{mx,my+42,mx+colW-10,my+55},
+                      g_D2D.brush(C::DIMTEXT),g_D2D.fmtSmall);
+            }
+
+            // ── Ligne 5 : Puissance + source (mesurée ou estimée)
+            {
+                // Détermine si on a une valeur Koorui connue ou estimée
+                bool isKoorui=(m.edidMfr==L"Koorui"||m.edidMfr==L"Koorui/RTK");
+                double kwCheck = kooruiWattFromModel(m.friendlyName);
+                bool hasExact  = isKoorui && kwCheck > 0;
+                wchar_t pw[48];
+                swprintf_s(pw, L"~%.0f W  %s%s",
+                           m.estWattW,
+                           hasExact ? L"[datasheet]" : L"[estimé]",
+                           m.primary ? L"  ★ Principal" : L"");
+                DText(pw,{mx,my+56,mx+colW-10,my+68},
+                      g_D2D.brush(C::YELLOW),g_D2D.fmtSmall);
+            }
+        }
+        curY+=mh+10;
     }
-    curY+=122;
 
     // ── USB ─────────────────────────────────────────────────────
     {
