@@ -936,12 +936,12 @@ static void Render(HWND hw) {
 // ─────────────────────────────────────────────────────────────────
 static void UpdateScrollbar(HWND hw) {
     RECT rc; GetClientRect(hw,&rc);
-    int viewH=rc.bottom;
+    int viewH=(int)rc.bottom;
     SCROLLINFO si{};
     si.cbSize=sizeof(si);
     si.fMask=SIF_RANGE|SIF_PAGE|SIF_POS;
     si.nMin=0; si.nMax=g_ContentH;
-    si.nPage=viewH; si.nPos=g_ScrollY;
+    si.nPage=(UINT)viewH; si.nPos=g_ScrollY;
     SetScrollInfo(hw,SB_VERT,&si,TRUE);
 }
 
@@ -1046,14 +1046,14 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         RECT rc; GetClientRect(hw,&rc);
         switch(LOWORD(wp)){
         case SB_TOP:        g_ScrollY=0; break;
-        case SB_BOTTOM:     g_ScrollY=g_ContentH-rc.bottom; break;
+        case SB_BOTTOM:     g_ScrollY=g_ContentH-(int)rc.bottom; break;
         case SB_LINEUP:     g_ScrollY-=30; break;
         case SB_LINEDOWN:   g_ScrollY+=30; break;
-        case SB_PAGEUP:     g_ScrollY-=rc.bottom; break;
-        case SB_PAGEDOWN:   g_ScrollY+=rc.bottom; break;
+        case SB_PAGEUP:     g_ScrollY-=(int)rc.bottom; break;
+        case SB_PAGEDOWN:   g_ScrollY+=(int)rc.bottom; break;
         case SB_THUMBTRACK: g_ScrollY=si.nTrackPos; break;
         }
-        g_ScrollY=std::clamp(g_ScrollY,0,std::max(0,g_ContentH-rc.bottom));
+        g_ScrollY=std::clamp(g_ScrollY,0,std::max(0,g_ContentH-(int)rc.bottom));
         UpdateScrollbar(hw);
         InvalidateRect(hw,nullptr,FALSE);
         break;
@@ -1062,7 +1062,7 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         int delta=GET_WHEEL_DELTA_WPARAM(wp);
         RECT rc; GetClientRect(hw,&rc);
         g_ScrollY=std::clamp(g_ScrollY-delta/2,0,
-                             std::max(0,g_ContentH-rc.bottom));
+                             std::max(0,g_ContentH-(int)rc.bottom));
         UpdateScrollbar(hw);
         InvalidateRect(hw,nullptr,FALSE);
         break;
