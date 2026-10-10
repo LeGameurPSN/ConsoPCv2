@@ -28,6 +28,11 @@
 #define _UNICODE
 #define COBJMACROS
 
+// Winsock2 DOIT être inclus avant windows.h avec WIN32_LEAN_AND_MEAN
+// sinon IP_ADAPTER_ADDRESSES, AF_INET, sockaddr_in, etc. ne sont pas définis
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -85,6 +90,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 // ─────────────────────────────────────────────────────────────────
 //  CONFIGURATION TDP
@@ -679,19 +685,13 @@ static void enumNetAdapters(std::vector<NetAdapterInfo>& adapters,
             a->PhysicalAddress[3],a->PhysicalAddress[4],a->PhysicalAddress[5]);
         ni.mac = mac;
 
-        // IPv4
+        // IPv4 — InetNtopW évite sprintf/MultiByteToWideChar (ws2_32)
         for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
             if (ua->Address.lpSockaddr->sa_family == AF_INET) {
-                char ip4[16]{};
                 auto* sa = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
-                sprintf_s(ip4, "%d.%d.%d.%d",
-                    sa->sin_addr.S_un.S_un_b.s_b1, sa->sin_addr.S_un.S_un_b.s_b2,
-                    sa->sin_addr.S_un.S_un_b.s_b3, sa->sin_addr.S_un.S_un_b.s_b4);
-                int sz = MultiByteToWideChar(CP_ACP,0,ip4,-1,nullptr,0);
-                std::wstring ws(sz,L'\0');
-                MultiByteToWideChar(CP_ACP,0,ip4,-1,ws.data(),sz);
-                while (!ws.empty()&&ws.back()==L'\0') ws.pop_back();
-                ni.ipv4 = ws;
+                wchar_t ip4w[48]{};
+                if (InetNtopW(AF_INET, &sa->sin_addr, ip4w, 47))
+                    ni.ipv4 = ip4w;
                 break;
             }
         }
