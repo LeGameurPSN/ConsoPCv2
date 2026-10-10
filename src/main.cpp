@@ -1685,7 +1685,7 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         case SB_PAGEDOWN:   g_ScrollY+=(int)rc.bottom; break;
         case SB_THUMBTRACK: g_ScrollY=si.nTrackPos; break;
         }
-        g_ScrollY=std::clamp(g_ScrollY,0,std::max(0,g_ContentH-(int)rc.bottom));
+        g_ScrollY=std::clamp<int>(g_ScrollY,0,std::max<int>(0,g_ContentH-(int)rc.bottom));
         UpdateScrollbar(hw);
         InvalidateRect(hw,nullptr,FALSE);
         break;
@@ -1693,8 +1693,8 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     case WM_MOUSEWHEEL:{
         int delta=GET_WHEEL_DELTA_WPARAM(wp);
         RECT rc; GetClientRect(hw,&rc);
-        g_ScrollY=std::clamp(g_ScrollY-delta/2,0,
-                             std::max(0,g_ContentH-(int)rc.bottom));
+        g_ScrollY=std::clamp<int>(g_ScrollY-delta/2,0,
+                             std::max<int>(0,g_ContentH-(int)rc.bottom));
         UpdateScrollbar(hw);
         InvalidateRect(hw,nullptr,FALSE);
         break;
