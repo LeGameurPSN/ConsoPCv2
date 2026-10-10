@@ -1564,7 +1564,7 @@ static void Render(HWND hw){
             swprintf_s(sub,L"Aucun ventilateur détecté via WMI");
         } else {
             std::wstring fanStr;
-            for(int i=0;i<(int)std::min((size_t)3,s.fans.size());i++){
+            for(int i=0;i<(int)s.fans.size()&&i<3;i++){
                 wchar_t tmp[32]; swprintf_s(tmp,L"%d tr/min",s.fans[i].rpm);
                 if(!fanStr.empty()) fanStr+=L"  |  ";
                 fanStr+=tmp;
@@ -1861,21 +1861,23 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         SCROLLINFO si{}; si.cbSize=sizeof(si); si.fMask=SIF_ALL;
         GetScrollInfo(hw,SB_VERT,&si);
         RECT rc; GetClientRect(hw,&rc);
-        switch(LOWORD(wp)){
-        case SB_TOP:        g_ScrollY=0; break;
-        case SB_BOTTOM:     g_ScrollY=g_ContentH-(int)rc.bottom; break;
-        case SB_LINEUP:     g_ScrollY-=30; break;
-        case SB_LINEDOWN:   g_ScrollY+=30; break;
-        case SB_PAGEUP:     g_ScrollY-=(int)rc.bottom; break;
-        case SB_PAGEDOWN:   g_ScrollY+=(int)rc.bottom; break;
-        case SB_THUMBTRACK: g_ScrollY=si.nTrackPos; break;
+        { int viewH=(int)rc.bottom;
+          switch(LOWORD(wp)){
+          case SB_TOP:        g_ScrollY=0; break;
+          case SB_BOTTOM:     g_ScrollY=g_ContentH-viewH; break;
+          case SB_LINEUP:     g_ScrollY-=30; break;
+          case SB_LINEDOWN:   g_ScrollY+=30; break;
+          case SB_PAGEUP:     g_ScrollY-=viewH; break;
+          case SB_PAGEDOWN:   g_ScrollY+=viewH; break;
+          case SB_THUMBTRACK: g_ScrollY=(int)si.nTrackPos; break;
+          }
+          int top=g_ContentH-viewH; g_ScrollY=g_ScrollY<0?0:(g_ScrollY>top&&top>0?top:g_ScrollY);
         }
-        g_ScrollY=std::clamp<int>(g_ScrollY,0,std::max<int>(0,g_ContentH-(int)rc.bottom));
         UpdateScrollbar(hw); InvalidateRect(hw,nullptr,FALSE); break;}
     case WM_MOUSEWHEEL:{
         int delta=GET_WHEEL_DELTA_WPARAM(wp);
         RECT rc; GetClientRect(hw,&rc);
-        g_ScrollY=std::clamp<int>(g_ScrollY-delta/2,0,std::max<int>(0,g_ContentH-(int)rc.bottom));
+        { int viewH=(int)rc.bottom; int top=g_ContentH-viewH; int npos=g_ScrollY-delta/2; g_ScrollY=npos<0?0:(npos>top&&top>0?top:npos); }
         UpdateScrollbar(hw); InvalidateRect(hw,nullptr,FALSE); break;}
     case WM_RBUTTONUP:{
         HMENU m=CreatePopupMenu();
