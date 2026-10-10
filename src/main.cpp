@@ -709,6 +709,7 @@ struct AdlPmLogData {
     unsigned int ulVersion;
     unsigned int ulActiveSampleRate;
     long long    ulLastUpdated;
+    unsigned int ulReserved[16];                     // champ présent dans le vrai SDK ADL — REQUIS pour l'alignement correct de ulValues
     unsigned int ulValues[ADL_PMLOG_MAX_SENSORS][2]; // [0]=valeur, [1]=support
 };
 
@@ -845,12 +846,12 @@ struct AdlCtx {
             }
         }
 
-        // Fallback : Overdrive6 — valeur en milliwatts × 100
+        // Fallback : Overdrive6 — valeur en unités de 1/8 W (fixe AMD)
         // ADL_OD6_POWER_TYPE_ASIC = 0
         if (pfOD6Pwr) {
             int val = 0;
             if (pfOD6Pwr(ctx, adapterIdx, 0, &val) == 0 && val > 0) {
-                return val / 100.0;  // milliwatts/100 → watts
+                return val / 8.0;   // unités 1/8 W → watts
             }
         }
 
